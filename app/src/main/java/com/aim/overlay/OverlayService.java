@@ -27,6 +27,7 @@ import android.media.projection.MediaProjection;
 import android.media.projection.MediaProjectionManager;
 import android.os.Build;
 import android.os.Handler;
+import android.os.HandlerThread;
 import android.os.IBinder;
 import android.os.Looper;
 import android.util.DisplayMetrics;
@@ -43,12 +44,13 @@ import java.nio.ByteBuffer;
 public class OverlayService extends Service {
     private WindowManager wm;
     private LineOverlayView lineView;
-    private View cueHandle;
-    private View targetHandle;
+    private BallHandleView cueHandle;
+    private BallHandleView targetHandle;
     private View tlHandle;
     private View brHandle;
     private LinearLayout menuView;
     private Button resetTableBtn;
+    private Button zoomBtn;
 
     private WindowManager.LayoutParams cueParams;
     private WindowManager.LayoutParams targetParams;
@@ -61,13 +63,18 @@ public class OverlayService extends Service {
     private SharedPreferences prefs;
 
     private int bounces = 1;
-    private int handleSize = 100; // Adjustable ball diameter (px)
+    private int handleSize = 100;
     private final int CORNER_HANDLE_SIZE = 100;
     private Button sizeLabelBtn;
 
     private int screenW;
     private int screenH;
     private int screenDpi;
+
+    // Zoom level: 1 = 2x, 2 = 3x, 0 = OFF
+    private int zoomLevel = 2; // Default 3x
+    private int cropSize = 80;
+    private final float LOUPE_RADIUS = 120f;
 
     // Magnifier state
     private boolean isDragging = false;
@@ -78,7 +85,14 @@ public class OverlayService extends Service {
     private MediaProjection mediaProjection;
     private VirtualDisplay virtualDisplay;
     private ImageReader imageReader;
-    private Bitmap screenBitmap;
+    private HandlerThread imageThread;
+    private Handler imageHandler;
+
+    // Fast reusable crop buffers
+    private final Object cropLock = new Object();
+    private Bitmap cropBitmap;
+    private byte[] rowBuffer;
+    private ByteBuffer cropByteBuffer;
 
     @Override
     public IBinder onBind(Intent intent) {
@@ -95,13 +109,14 @@ public class OverlayService extends Service {
 
         DisplayMetrics dm = new DisplayMetrics();
         wm.getDefaultDisplay().getRealMetrics(dm);
-        // Force landscape logic (8BP is exclusively landscape)
         screenW = Math.max(dm.widthPixels, dm.heightPixels);
         screenH = Math.min(dm.widthPixels, dm.heightPixels);
         screenDpi = dm.densityDpi;
 
-        // Load preferences
         handleSize = prefs.getInt("handle_size", 100);
+        zoomLevel = prefs.getInt("zoom_level", 2);
+        updateCropDimensions();
+
         recalculateTableBoundsFromRatios();
 
         // 1. Pass-through line drawing overlay
@@ -150,8 +165,25 @@ public class OverlayService extends Service {
         }, false);
         wm.addView(brHandle, brParams);
 
-        // 5. Clean Control Panel
+        // 5. Control Panel
         createMenuView();
+
+        // 6. Background thread for screen capture
+        imageThread = new HandlerThread("ScreenCaptureThread");
+        imageThread.start();
+        imageHandler = new Handler(imageThread.getLooper());
+    }
+
+    private void updateCropDimensions() {
+        if (zoomLevel == 1) cropSize = 120; // 2x
+        else if (zoomLevel == 2) cropSize = 80;  // 3x
+        else cropSize = 80;
+
+        synchronized (cropLock) {
+            cropBitmap = Bitmap.createBitmap(cropSize, cropSize, Bitmap.Config.ARGB_8888);
+            rowBuffer = new byte[cropSize * 4];
+            cropByteBuffer = ByteBuffer.allocateDirect(cropSize * cropSize * 4);
+        }
     }
 
     private void recalculateTableBoundsFromRatios() {
@@ -160,7 +192,6 @@ public class OverlayService extends Service {
         float rR = prefs.getFloat("r_right", 0.885f);
         float rB = prefs.getFloat("r_bottom", 0.835f);
 
-        // Clamp ratios to prevent overflow or inversion
         if (rL < 0f || rL > 0.4f) rL = 0.115f;
         if (rT < 0f || rT > 0.4f) rT = 0.165f;
         if (rR > 1f || rR < 0.6f) rR = 0.885f;
@@ -209,26 +240,99 @@ public class OverlayService extends Service {
     }
 
     private void initMediaProjection(int code, Intent data) {
-        MediaProjectionManager mpm = (MediaProjectionManager) getSystemService(MEDIA_PROJECTION_SERVICE);
-        if (mpm == null) return;
-        mediaProjection = mpm.getMediaProjection(code, data);
-        if (mediaProjection == null) return;
+        try {
+            MediaProjectionManager mpm = (MediaProjectionManager) getSystemService(MEDIA_PROJECTION_SERVICE);
+            if (mpm == null) return;
+            mediaProjection = mpm.getMediaProjection(code, data);
+            if (mediaProjection == null) return;
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            mediaProjection.registerCallback(new MediaProjection.Callback() {}, new Handler(Looper.getMainLooper()));
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                mediaProjection.registerCallback(new MediaProjection.Callback() {}, new Handler(Looper.getMainLooper()));
+            }
+
+            setupVirtualDisplay();
+        } catch (Exception ignored) {}
+    }
+
+    private void setupVirtualDisplay() {
+        if (mediaProjection == null || screenW <= 0 || screenH <= 0) return;
+
+        if (imageReader != null) {
+            imageReader.close();
         }
 
         imageReader = ImageReader.newInstance(screenW, screenH, PixelFormat.RGBA_8888, 2);
-        virtualDisplay = mediaProjection.createVirtualDisplay(
-                "AimLoupe",
-                screenW,
-                screenH,
-                screenDpi,
-                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-                imageReader.getSurface(),
-                null,
-                null
-        );
+        imageReader.setOnImageAvailableListener(reader -> {
+            Image image = null;
+            try {
+                image = reader.acquireLatestImage();
+                if (image != null && isDragging && zoomLevel > 0) {
+                    processScreenCrop(image, (int) dragX, (int) dragY);
+                    if (lineView != null) {
+                        lineView.postInvalidate();
+                    }
+                }
+            } catch (Exception ignored) {
+            } finally {
+                if (image != null) {
+                    image.close();
+                }
+            }
+        }, imageHandler);
+
+        if (virtualDisplay == null) {
+            virtualDisplay = mediaProjection.createVirtualDisplay(
+                    "AimLoupe",
+                    screenW,
+                    screenH,
+                    screenDpi,
+                    DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+                    imageReader.getSurface(),
+                    null,
+                    null
+            );
+        } else {
+            virtualDisplay.resize(screenW, screenH, screenDpi);
+            virtualDisplay.setSurface(imageReader.getSurface());
+        }
+    }
+
+    // Sub-millisecond precise buffer crop centered exactly on target ball
+    private void processScreenCrop(Image image, int centerX, int centerY) {
+        try {
+            Image.Plane plane = image.getPlanes()[0];
+            ByteBuffer buffer = plane.getBuffer();
+            int rowStride = plane.getRowStride();
+            int pixelStride = plane.getPixelStride();
+
+            int startX = Math.max(0, Math.min(screenW - cropSize, centerX - cropSize / 2));
+            int startY = Math.max(0, Math.min(screenH - cropSize, centerY - cropSize / 2));
+
+            synchronized (cropLock) {
+                if (cropByteBuffer == null || cropBitmap == null) return;
+                cropByteBuffer.rewind();
+
+                for (int r = 0; r < cropSize; r++) {
+                    int offset = (startY + r) * rowStride + startX * pixelStride;
+                    if (offset + cropSize * pixelStride <= buffer.capacity()) {
+                        buffer.position(offset);
+                        if (pixelStride == 4) {
+                            buffer.get(rowBuffer, 0, cropSize * 4);
+                            cropByteBuffer.put(rowBuffer, 0, cropSize * 4);
+                        } else {
+                            for (int c = 0; c < cropSize; c++) {
+                                buffer.position(offset + c * pixelStride);
+                                buffer.get(rowBuffer, 0, 4);
+                                cropByteBuffer.put(rowBuffer, 0, 4);
+                            }
+                        }
+                    }
+                }
+
+                cropByteBuffer.rewind();
+                cropBitmap.copyPixelsFromBuffer(cropByteBuffer);
+            }
+        } catch (Exception ignored) {}
     }
 
     private WindowManager.LayoutParams createHandleParams(int x, int y, int size) {
@@ -266,12 +370,14 @@ public class OverlayService extends Service {
                             isDragging = true;
                             dragX = p.x + curSize / 2f;
                             dragY = p.y + curSize / 2f;
+                            if (v instanceof BallHandleView) {
+                                ((BallHandleView) v).setDragging(true);
+                            }
                             lineView.invalidate();
                         }
                         return true;
 
                     case MotionEvent.ACTION_MOVE:
-                        // Clamp drag inside screen boundaries to prevent handle loss/overflow
                         p.x = Math.max(0, Math.min(screenW - curSize, initialX + (int) (event.getRawX() - touchX)));
                         p.y = Math.max(0, Math.min(screenH - curSize, initialY + (int) (event.getRawY() - touchY)));
                         if (isBall) {
@@ -287,6 +393,9 @@ public class OverlayService extends Service {
                     case MotionEvent.ACTION_CANCEL:
                         if (isBall) {
                             isDragging = false;
+                            if (v instanceof BallHandleView) {
+                                ((BallHandleView) v).setDragging(false);
+                            }
                             lineView.invalidate();
                         }
                         return true;
@@ -301,7 +410,6 @@ public class OverlayService extends Service {
         menuView.setOrientation(LinearLayout.HORIZONTAL);
         menuView.setGravity(Gravity.CENTER_VERTICAL);
 
-        // Modern card background
         GradientDrawable panelBg = new GradientDrawable();
         panelBg.setColor(0xEE1E2128);
         panelBg.setCornerRadius(30f);
@@ -326,7 +434,18 @@ public class OverlayService extends Service {
         });
         menuView.addView(cushionBtn);
 
-        // 3. Table Button
+        // 3. Zoom Button (OFF / 2x / 3x)
+        zoomBtn = createStyledButton(getZoomText(), 0xFFFF4081, 0x22FF4081);
+        zoomBtn.setOnClickListener(v -> {
+            zoomLevel = (zoomLevel + 1) % 3;
+            prefs.edit().putInt("zoom_level", zoomLevel).apply();
+            zoomBtn.setText(getZoomText());
+            updateCropDimensions();
+            lineView.invalidate();
+        });
+        menuView.addView(zoomBtn);
+
+        // 4. Table Button
         Button tableBtn = createStyledButton("Table: LOCK", 0xFF00E676, 0x2200E676);
         tableBtn.setOnClickListener(v -> {
             isCalibrating = !isCalibrating;
@@ -340,7 +459,6 @@ public class OverlayService extends Service {
                 resetTableBtn.setVisibility(isCalibrating ? View.VISIBLE : View.GONE);
             }
             if (!isCalibrating) {
-                // Save normalized relative ratios (immune to resolution/overflow issues)
                 prefs.edit()
                         .putFloat("r_left", tableBounds.left / screenW)
                         .putFloat("r_top", tableBounds.top / screenH)
@@ -352,13 +470,13 @@ public class OverlayService extends Service {
         });
         menuView.addView(tableBtn);
 
-        // Reset Table Button (visible only in EDIT mode)
+        // Reset Table Button
         resetTableBtn = createStyledButton("Reset", 0xFFFF9100, 0x22FF9100);
         resetTableBtn.setVisibility(View.GONE);
         resetTableBtn.setOnClickListener(v -> resetTableBoundsToDefault());
         menuView.addView(resetTableBtn);
 
-        // 4. Circle Size Controls ([-] Size: 100 [+])
+        // 5. Circle Size Controls ([-] Size: 100 [+])
         Button sizeMinus = createStyledButton("–", Color.WHITE, 0x22FFFFFF);
         sizeMinus.setOnClickListener(v -> updateHandleSize(handleSize - 10));
         menuView.addView(sizeMinus);
@@ -371,7 +489,7 @@ public class OverlayService extends Service {
         sizePlus.setOnClickListener(v -> updateHandleSize(handleSize + 10));
         menuView.addView(sizePlus);
 
-        // 5. Close Button
+        // 6. Close Button
         Button closeBtn = createStyledButton("✕", 0xFFFF5252, 0x33FF5252);
         closeBtn.setOnClickListener(v -> stopSelf());
         menuView.addView(closeBtn);
@@ -388,7 +506,6 @@ public class OverlayService extends Service {
         menuParams.gravity = Gravity.TOP | Gravity.CENTER_HORIZONTAL;
         menuParams.y = 20;
 
-        // Draggable panel
         menuView.setOnTouchListener(new View.OnTouchListener() {
             private int initialX, initialY;
             private float touchX, touchY;
@@ -413,6 +530,12 @@ public class OverlayService extends Service {
         });
 
         wm.addView(menuView, menuParams);
+    }
+
+    private String getZoomText() {
+        if (zoomLevel == 0) return "Zoom: OFF";
+        if (zoomLevel == 1) return "Zoom: 2x";
+        return "Zoom: 3x";
     }
 
     private Button createStyledButton(String text, int textColor, int bgColor) {
@@ -492,6 +615,7 @@ public class OverlayService extends Service {
         super.onDestroy();
         if (virtualDisplay != null) virtualDisplay.release();
         if (imageReader != null) imageReader.close();
+        if (imageThread != null) imageThread.quitSafely();
         if (mediaProjection != null) mediaProjection.stop();
         if (lineView != null) wm.removeView(lineView);
         if (cueHandle != null) wm.removeView(cueHandle);
@@ -514,9 +638,6 @@ public class OverlayService extends Service {
         private final Paint pointerPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
         private final Path clipPath = new Path();
 
-        private final float LOUPE_RADIUS = 110f;
-        private final float CROP_RADIUS = 44f;
-
         public LineOverlayView(Context context) {
             super(context);
             aimPaint.setColor(Color.WHITE);
@@ -536,13 +657,13 @@ public class OverlayService extends Service {
 
             loupeBorderPaint.setColor(Color.WHITE);
             loupeBorderPaint.setStyle(Paint.Style.STROKE);
-            loupeBorderPaint.setStrokeWidth(5f);
+            loupeBorderPaint.setStrokeWidth(6f);
 
-            crosshairPaint.setColor(Color.RED);
+            crosshairPaint.setColor(0xFFFF1744);
             crosshairPaint.setStyle(Paint.Style.STROKE);
             crosshairPaint.setStrokeWidth(2.5f);
 
-            pointerPaint.setColor(0xCCFFFFFF);
+            pointerPaint.setColor(0x88FFFFFF);
             pointerPaint.setStyle(Paint.Style.STROKE);
             pointerPaint.setStrokeWidth(3f);
         }
@@ -550,10 +671,11 @@ public class OverlayService extends Service {
         @Override
         protected void onSizeChanged(int w, int h, int oldw, int oldh) {
             super.onSizeChanged(w, h, oldw, oldh);
-            if (w > 0 && h > 0) {
+            if (w > 0 && h > 0 && (w != screenW || h != screenH)) {
                 screenW = w;
                 screenH = h;
                 recalculateTableBoundsFromRatios();
+                setupVirtualDisplay();
             }
         }
 
@@ -563,27 +685,6 @@ public class OverlayService extends Service {
             int w = getWidth();
             int h = getHeight();
             if (w == 0 || h == 0) return;
-
-            // Update screen capture buffer if available
-            if (imageReader != null) {
-                try {
-                    Image img = imageReader.acquireLatestImage();
-                    if (img != null) {
-                        Image.Plane plane = img.getPlanes()[0];
-                        ByteBuffer buf = plane.getBuffer();
-                        int pixelStride = plane.getPixelStride();
-                        int rowStride = plane.getRowStride();
-                        int rowPadding = rowStride - pixelStride * screenW;
-                        int bmpW = screenW + rowPadding / pixelStride;
-                        if (screenBitmap == null || screenBitmap.getWidth() != bmpW) {
-                            screenBitmap = Bitmap.createBitmap(bmpW, screenH, Bitmap.Config.ARGB_8888);
-                        }
-                        buf.rewind();
-                        screenBitmap.copyPixelsFromBuffer(buf);
-                        img.close();
-                    }
-                } catch (Exception ignored) {}
-            }
 
             // Draw table cushion boundary
             tableBorderPaint.setColor(isCalibrating ? 0xAA00FF00 : 0x3300FF00);
@@ -610,7 +711,7 @@ public class OverlayService extends Service {
             float tanY = dx * 120f;
             canvas.drawLine(tx - tanX, ty - tanY, tx + tanX, ty + tanY, tangentPaint);
 
-            // 3. Cushion Bank Shot Raycast (with overflow & corner clamp protection)
+            // 3. Cushion Bank Shot Raycast
             if (bounces > 0 && tableBounds.width() > 100 && tableBounds.height() > 100) {
                 float curX = Math.max(tableBounds.left, Math.min(tableBounds.right, tx));
                 float curY = Math.max(tableBounds.top, Math.min(tableBounds.bottom, ty));
@@ -619,7 +720,7 @@ public class OverlayService extends Service {
 
                 for (int b = 0; b < bounces; b++) {
                     float minT = Float.MAX_VALUE;
-                    int side = 0; // 1=L, 2=R, 3=T, 4=B
+                    int side = 0;
 
                     if (dirX < -0.0001f) {
                         float t = (tableBounds.left - curX) / dirX;
@@ -666,7 +767,6 @@ public class OverlayService extends Service {
                     float nextX = curX + minT * dirX;
                     float nextY = curY + minT * dirY;
 
-                    // Strictly clamp to prevent visual overflow outside table borders
                     nextX = Math.max(tableBounds.left, Math.min(tableBounds.right, nextX));
                     nextY = Math.max(tableBounds.top, Math.min(tableBounds.bottom, nextY));
 
@@ -682,56 +782,58 @@ public class OverlayService extends Service {
             }
 
             // 4. Magnifier Loupe above active finger position
-            if (isDragging) {
+            if (isDragging && zoomLevel > 0) {
                 float lx = dragX;
-                float ly = dragY - 220f;
+                float ly = dragY - 190f;
+
+                // If close to top edge, shift horizontally instead of under palm
                 if (ly - LOUPE_RADIUS < 20f) {
-                    ly = dragY + 220f;
+                    ly = dragY;
+                    lx = (dragX + 220f + LOUPE_RADIUS < screenW) ? (dragX + 220f) : (dragX - 220f);
                 }
 
-                // Guide needle from loupe to contact center
-                canvas.drawLine(lx, ly + (ly < dragY ? LOUPE_RADIUS : -LOUPE_RADIUS), dragX, dragY, pointerPaint);
+                // Guide needle
+                canvas.drawLine(lx, ly, dragX, dragY, pointerPaint);
 
                 canvas.save();
                 clipPath.reset();
                 clipPath.addCircle(lx, ly, LOUPE_RADIUS, Path.Direction.CW);
                 canvas.clipPath(clipPath);
 
-                if (screenBitmap != null) {
-                    int srcL = (int) Math.max(0, dragX - CROP_RADIUS);
-                    int srcT = (int) Math.max(0, dragY - CROP_RADIUS);
-                    int srcR = (int) Math.min(screenBitmap.getWidth(), dragX + CROP_RADIUS);
-                    int srcB = (int) Math.min(screenBitmap.getHeight(), dragY + CROP_RADIUS);
-                    Rect src = new Rect(srcL, srcT, srcR, srcB);
-                    Rect dst = new Rect(
-                            (int) (lx - LOUPE_RADIUS),
-                            (int) (ly - LOUPE_RADIUS),
-                            (int) (lx + LOUPE_RADIUS),
-                            (int) (ly + LOUPE_RADIUS)
-                    );
-                    canvas.drawBitmap(screenBitmap, src, dst, null);
-                } else {
-                    canvas.drawColor(0xDD111111);
+                synchronized (cropLock) {
+                    if (cropBitmap != null) {
+                        Rect src = new Rect(0, 0, cropSize, cropSize);
+                        Rect dst = new Rect(
+                                (int) (lx - LOUPE_RADIUS),
+                                (int) (ly - LOUPE_RADIUS),
+                                (int) (lx + LOUPE_RADIUS),
+                                (int) (ly + LOUPE_RADIUS)
+                        );
+                        canvas.drawBitmap(cropBitmap, src, dst, null);
+                    } else {
+                        canvas.drawColor(0xEE1A1A1A);
+                    }
                 }
 
-                // Crosshair at center of magnifying glass
+                // Crisp target crosshairs exactly aligned with center of ball
                 canvas.drawLine(lx - 25f, ly, lx + 25f, ly, crosshairPaint);
                 canvas.drawLine(lx, ly - 25f, lx, ly + 25f, crosshairPaint);
-                canvas.drawCircle(lx, ly, 3f, crosshairPaint);
+                canvas.drawCircle(lx, ly, 4f, crosshairPaint);
 
                 canvas.restore();
 
-                // Loupe border
+                // Outer border
                 canvas.drawCircle(lx, ly, LOUPE_RADIUS, loupeBorderPaint);
             }
         }
     }
 
-    // Draggable circular handle
+    // Draggable circular handle with drag transparency
     private static class BallHandleView extends View {
         private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
         private final Paint textPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
         private final String label;
+        private boolean isDragging = false;
 
         public BallHandleView(Context context, int color, String label) {
             super(context);
@@ -745,13 +847,21 @@ public class OverlayService extends Service {
             textPaint.setTextAlign(Paint.Align.CENTER);
         }
 
+        public void setDragging(boolean dragging) {
+            this.isDragging = dragging;
+            setAlpha(dragging ? 0.35f : 1.0f); // Make semi-transparent so magnifier captures the ball beneath
+            invalidate();
+        }
+
         @Override
         protected void onDraw(Canvas canvas) {
             super.onDraw(canvas);
             float r = getWidth() / 2f;
             canvas.drawCircle(r, r, r - 5f, paint);
             canvas.drawCircle(r, r, 4f, paint);
-            canvas.drawText(label, r, r - 10f, textPaint);
+            if (!isDragging) {
+                canvas.drawText(label, r, r - 10f, textPaint);
+            }
         }
     }
 }
