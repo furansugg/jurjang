@@ -16,6 +16,7 @@ import android.graphics.DashPathEffect;
 import android.graphics.Paint;
 import android.graphics.Path;
 import android.graphics.PixelFormat;
+import android.graphics.Point;
 import android.graphics.Rect;
 import android.graphics.RectF;
 import android.graphics.drawable.GradientDrawable;
@@ -30,7 +31,7 @@ import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.IBinder;
 import android.os.Looper;
-import android.util.DisplayMetrics;
+import android.view.Display;
 import android.view.Gravity;
 import android.view.MotionEvent;
 import android.view.View;
@@ -51,6 +52,7 @@ public class OverlayService extends Service {
     private LinearLayout menuView;
     private Button resetTableBtn;
     private Button zoomBtn;
+    private Button nudgeTargetBtn;
 
     private WindowManager.LayoutParams cueParams;
     private WindowManager.LayoutParams targetParams;
@@ -66,13 +68,14 @@ public class OverlayService extends Service {
     private int handleSize = 100;
     private final int CORNER_HANDLE_SIZE = 100;
     private Button sizeLabelBtn;
+    private boolean nudgeAim = true; // true = AIM handle, false = CUE handle
 
     private int screenW;
     private int screenH;
     private int screenDpi;
 
     // Zoom level: 1 = 2x, 2 = 3x, 0 = OFF
-    private int zoomLevel = 2; // Default 3x
+    private int zoomLevel = 2;
     private int cropSize = 80;
     private final float LOUPE_RADIUS = 120f;
 
@@ -88,11 +91,18 @@ public class OverlayService extends Service {
     private HandlerThread imageThread;
     private Handler imageHandler;
 
+    // Raw full-frame buffer cache
+    private final Object screenBufferLock = new Object();
+    private ByteBuffer screenRawBuffer;
+    private int lastRowStride = 0;
+    private int lastPixelStride = 4;
+    private boolean hasScreenFrame = false;
+
     // Fast reusable crop buffers
     private final Object cropLock = new Object();
     private Bitmap cropBitmap;
-    private byte[] rowBuffer;
     private ByteBuffer cropByteBuffer;
+    private final byte[] pixelBuffer = new byte[4];
 
     @Override
     public IBinder onBind(Intent intent) {
@@ -107,11 +117,7 @@ public class OverlayService extends Service {
         wm = (WindowManager) getSystemService(Context.WINDOW_SERVICE);
         prefs = getSharedPreferences("8bp_aim_prefs", MODE_PRIVATE);
 
-        DisplayMetrics dm = new DisplayMetrics();
-        wm.getDefaultDisplay().getRealMetrics(dm);
-        screenW = Math.max(dm.widthPixels, dm.heightPixels);
-        screenH = Math.min(dm.widthPixels, dm.heightPixels);
-        screenDpi = dm.densityDpi;
+        updateScreenMetrics();
 
         handleSize = prefs.getInt("handle_size", 100);
         zoomLevel = prefs.getInt("zoom_level", 2);
@@ -119,7 +125,7 @@ public class OverlayService extends Service {
 
         recalculateTableBoundsFromRatios();
 
-        // 1. Pass-through line drawing overlay
+        // 1. Pass-through line drawing overlay with true physical screen layout
         lineView = new LineOverlayView(this);
         WindowManager.LayoutParams lineParams = new WindowManager.LayoutParams(
                 WindowManager.LayoutParams.MATCH_PARENT,
@@ -129,9 +135,13 @@ public class OverlayService extends Service {
                         : WindowManager.LayoutParams.TYPE_PHONE,
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
                         | WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
-                        | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                        | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
+                        | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
                 PixelFormat.TRANSLUCENT
         );
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            lineParams.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
+        }
         wm.addView(lineView, lineParams);
 
         // 2. Cue Ball Handle
@@ -174,6 +184,15 @@ public class OverlayService extends Service {
         imageHandler = new Handler(imageThread.getLooper());
     }
 
+    private void updateScreenMetrics() {
+        Display display = wm.getDefaultDisplay();
+        Point size = new Point();
+        display.getRealSize(size);
+        screenW = Math.max(size.x, size.y);
+        screenH = Math.min(size.x, size.y);
+        screenDpi = getResources().getDisplayMetrics().densityDpi;
+    }
+
     private void updateCropDimensions() {
         if (zoomLevel == 1) cropSize = 120; // 2x
         else if (zoomLevel == 2) cropSize = 80;  // 3x
@@ -181,7 +200,6 @@ public class OverlayService extends Service {
 
         synchronized (cropLock) {
             cropBitmap = Bitmap.createBitmap(cropSize, cropSize, Bitmap.Config.ARGB_8888);
-            rowBuffer = new byte[cropSize * 4];
             cropByteBuffer = ByteBuffer.allocateDirect(cropSize * cropSize * 4);
         }
     }
@@ -266,10 +284,26 @@ public class OverlayService extends Service {
             Image image = null;
             try {
                 image = reader.acquireLatestImage();
-                if (image != null && isDragging && zoomLevel > 0) {
-                    processScreenCrop(image, (int) dragX, (int) dragY);
-                    if (lineView != null) {
-                        lineView.postInvalidate();
+                if (image != null) {
+                    Image.Plane plane = image.getPlanes()[0];
+                    ByteBuffer buf = plane.getBuffer();
+                    synchronized (screenBufferLock) {
+                        lastRowStride = plane.getRowStride();
+                        lastPixelStride = plane.getPixelStride();
+                        if (screenRawBuffer == null || screenRawBuffer.capacity() < buf.capacity()) {
+                            screenRawBuffer = ByteBuffer.allocateDirect(buf.capacity());
+                        }
+                        screenRawBuffer.rewind();
+                        buf.rewind();
+                        screenRawBuffer.put(buf);
+                        hasScreenFrame = true;
+                    }
+
+                    if (isDragging && zoomLevel > 0) {
+                        extractCropFromBuffer((int) dragX, (int) dragY);
+                        if (lineView != null) {
+                            lineView.postInvalidate();
+                        }
                     }
                 }
             } catch (Exception ignored) {
@@ -297,34 +331,43 @@ public class OverlayService extends Service {
         }
     }
 
-    // Sub-millisecond precise buffer crop centered exactly on target ball
-    private void processScreenCrop(Image image, int centerX, int centerY) {
-        try {
-            Image.Plane plane = image.getPlanes()[0];
-            ByteBuffer buffer = plane.getBuffer();
-            int rowStride = plane.getRowStride();
-            int pixelStride = plane.getPixelStride();
-
-            int startX = Math.max(0, Math.min(screenW - cropSize, centerX - cropSize / 2));
-            int startY = Math.max(0, Math.min(screenH - cropSize, centerY - cropSize / 2));
-
+    // Zero-offset direct extraction from screen buffer; center of crop is 100% exact to (cx, cy)
+    private void extractCropFromBuffer(int cx, int cy) {
+        synchronized (screenBufferLock) {
+            if (!hasScreenFrame || screenRawBuffer == null || lastRowStride == 0) return;
             synchronized (cropLock) {
                 if (cropByteBuffer == null || cropBitmap == null) return;
                 cropByteBuffer.rewind();
 
+                int startX = cx - cropSize / 2;
+                int startY = cy - cropSize / 2;
+
                 for (int r = 0; r < cropSize; r++) {
-                    int offset = (startY + r) * rowStride + startX * pixelStride;
-                    if (offset + cropSize * pixelStride <= buffer.capacity()) {
-                        buffer.position(offset);
-                        if (pixelStride == 4) {
-                            buffer.get(rowBuffer, 0, cropSize * 4);
-                            cropByteBuffer.put(rowBuffer, 0, cropSize * 4);
-                        } else {
-                            for (int c = 0; c < cropSize; c++) {
-                                buffer.position(offset + c * pixelStride);
-                                buffer.get(rowBuffer, 0, 4);
-                                cropByteBuffer.put(rowBuffer, 0, 4);
+                    int y = startY + r;
+                    if (y >= 0 && y < screenH) {
+                        for (int c = 0; c < cropSize; c++) {
+                            int x = startX + c;
+                            if (x >= 0 && x < screenW) {
+                                int offset = y * lastRowStride + x * lastPixelStride;
+                                if (offset + 4 <= screenRawBuffer.capacity()) {
+                                    screenRawBuffer.position(offset);
+                                    screenRawBuffer.get(pixelBuffer, 0, 4);
+                                    cropByteBuffer.put(pixelBuffer, 0, 4);
+                                    continue;
+                                }
                             }
+                            // Neutral padding for edge coordinates
+                            cropByteBuffer.put((byte) 0x1A);
+                            cropByteBuffer.put((byte) 0x1A);
+                            cropByteBuffer.put((byte) 0x1A);
+                            cropByteBuffer.put((byte) 0xFF);
+                        }
+                    } else {
+                        for (int c = 0; c < cropSize; c++) {
+                            cropByteBuffer.put((byte) 0x1A);
+                            cropByteBuffer.put((byte) 0x1A);
+                            cropByteBuffer.put((byte) 0x1A);
+                            cropByteBuffer.put((byte) 0xFF);
                         }
                     }
                 }
@@ -332,7 +375,7 @@ public class OverlayService extends Service {
                 cropByteBuffer.rewind();
                 cropBitmap.copyPixelsFromBuffer(cropByteBuffer);
             }
-        } catch (Exception ignored) {}
+        }
     }
 
     private WindowManager.LayoutParams createHandleParams(int x, int y, int size) {
@@ -343,9 +386,13 @@ public class OverlayService extends Service {
                         ? WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
                         : WindowManager.LayoutParams.TYPE_PHONE,
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
-                        | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                        | WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS
+                        | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
                 PixelFormat.TRANSLUCENT
         );
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            p.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
+        }
         p.gravity = Gravity.TOP | Gravity.START;
         p.x = x;
         p.y = y;
@@ -368,11 +415,14 @@ public class OverlayService extends Service {
                         touchY = event.getRawY();
                         if (isBall) {
                             isDragging = true;
-                            dragX = p.x + curSize / 2f;
-                            dragY = p.y + curSize / 2f;
+                            int[] loc = new int[2];
+                            v.getLocationOnScreen(loc);
+                            dragX = loc[0] + curSize / 2f;
+                            dragY = loc[1] + curSize / 2f;
                             if (v instanceof BallHandleView) {
                                 ((BallHandleView) v).setDragging(true);
                             }
+                            extractCropFromBuffer((int) dragX, (int) dragY);
                             lineView.invalidate();
                         }
                         return true;
@@ -380,12 +430,16 @@ public class OverlayService extends Service {
                     case MotionEvent.ACTION_MOVE:
                         p.x = Math.max(0, Math.min(screenW - curSize, initialX + (int) (event.getRawX() - touchX)));
                         p.y = Math.max(0, Math.min(screenH - curSize, initialY + (int) (event.getRawY() - touchY)));
+                        wm.updateViewLayout(v, p);
+
                         if (isBall) {
-                            dragX = p.x + curSize / 2f;
-                            dragY = p.y + curSize / 2f;
+                            int[] loc = new int[2];
+                            v.getLocationOnScreen(loc);
+                            dragX = loc[0] + curSize / 2f;
+                            dragY = loc[1] + curSize / 2f;
+                            extractCropFromBuffer((int) dragX, (int) dragY);
                         }
                         if (onDragCallback != null) onDragCallback.run();
-                        wm.updateViewLayout(v, p);
                         lineView.invalidate();
                         return true;
 
@@ -405,6 +459,21 @@ public class OverlayService extends Service {
         });
     }
 
+    private void nudge(int dx, int dy) {
+        WindowManager.LayoutParams p = nudgeAim ? targetParams : cueParams;
+        View v = nudgeAim ? targetHandle : cueHandle;
+        p.x = Math.max(0, Math.min(screenW - handleSize, p.x + dx));
+        p.y = Math.max(0, Math.min(screenH - handleSize, p.y + dy));
+        wm.updateViewLayout(v, p);
+
+        int[] loc = new int[2];
+        v.getLocationOnScreen(loc);
+        dragX = loc[0] + handleSize / 2f;
+        dragY = loc[1] + handleSize / 2f;
+        extractCropFromBuffer((int) dragX, (int) dragY);
+        lineView.invalidate();
+    }
+
     private void createMenuView() {
         menuView = new LinearLayout(this);
         menuView.setOrientation(LinearLayout.HORIZONTAL);
@@ -415,14 +484,14 @@ public class OverlayService extends Service {
         panelBg.setCornerRadius(30f);
         panelBg.setStroke(2, 0x44FFFFFF);
         menuView.setBackground(panelBg);
-        menuView.setPadding(18, 10, 18, 10);
+        menuView.setPadding(14, 8, 14, 8);
 
         // 1. Grip / Title
         TextView grip = new TextView(this);
         grip.setText("⠿ 8BP");
         grip.setTextColor(0xFFAAAAAA);
         grip.setTextSize(11f);
-        grip.setPadding(6, 0, 14, 0);
+        grip.setPadding(4, 0, 10, 0);
         menuView.addView(grip);
 
         // 2. Cushion Button
@@ -470,13 +539,12 @@ public class OverlayService extends Service {
         });
         menuView.addView(tableBtn);
 
-        // Reset Table Button
         resetTableBtn = createStyledButton("Reset", 0xFFFF9100, 0x22FF9100);
         resetTableBtn.setVisibility(View.GONE);
         resetTableBtn.setOnClickListener(v -> resetTableBoundsToDefault());
         menuView.addView(resetTableBtn);
 
-        // 5. Circle Size Controls ([-] Size: 100 [+])
+        // 5. Circle Size Controls ([-] Size [+]
         Button sizeMinus = createStyledButton("–", Color.WHITE, 0x22FFFFFF);
         sizeMinus.setOnClickListener(v -> updateHandleSize(handleSize - 10));
         menuView.addView(sizeMinus);
@@ -489,7 +557,31 @@ public class OverlayService extends Service {
         sizePlus.setOnClickListener(v -> updateHandleSize(handleSize + 10));
         menuView.addView(sizePlus);
 
-        // 6. Close Button
+        // 6. 1-Pixel Micro-Adjustment Nudge D-Pad
+        nudgeTargetBtn = createStyledButton("Nudge: AIM", 0xFFE040FB, 0x22E040FB);
+        nudgeTargetBtn.setOnClickListener(v -> {
+            nudgeAim = !nudgeAim;
+            nudgeTargetBtn.setText(nudgeAim ? "Nudge: AIM" : "Nudge: CUE");
+        });
+        menuView.addView(nudgeTargetBtn);
+
+        Button btnLeft = createStyledButton("◀", Color.WHITE, 0x22FFFFFF);
+        btnLeft.setOnClickListener(v -> nudge(-1, 0));
+        menuView.addView(btnLeft);
+
+        Button btnUp = createStyledButton("▲", Color.WHITE, 0x22FFFFFF);
+        btnUp.setOnClickListener(v -> nudge(0, -1));
+        menuView.addView(btnUp);
+
+        Button btnDown = createStyledButton("▼", Color.WHITE, 0x22FFFFFF);
+        btnDown.setOnClickListener(v -> nudge(0, 1));
+        menuView.addView(btnDown);
+
+        Button btnRight = createStyledButton("▶", Color.WHITE, 0x22FFFFFF);
+        btnRight.setOnClickListener(v -> nudge(1, 0));
+        menuView.addView(btnRight);
+
+        // 7. Close Button
         Button closeBtn = createStyledButton("✕", 0xFFFF5252, 0x33FF5252);
         closeBtn.setOnClickListener(v -> stopSelf());
         menuView.addView(closeBtn);
@@ -500,11 +592,15 @@ public class OverlayService extends Service {
                 Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
                         ? WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
                         : WindowManager.LayoutParams.TYPE_PHONE,
-                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                        | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
                 PixelFormat.TRANSLUCENT
         );
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            menuParams.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
+        }
         menuParams.gravity = Gravity.TOP | Gravity.CENTER_HORIZONTAL;
-        menuParams.y = 20;
+        menuParams.y = 15;
 
         menuView.setOnTouchListener(new View.OnTouchListener() {
             private int initialX, initialY;
@@ -542,9 +638,9 @@ public class OverlayService extends Service {
         Button b = new Button(this);
         b.setText(text);
         b.setTextColor(textColor);
-        b.setTextSize(11f);
+        b.setTextSize(10.5f);
         b.setAllCaps(false);
-        b.setPadding(20, 8, 20, 8);
+        b.setPadding(16, 6, 16, 6);
         b.setMinHeight(0);
         b.setMinimumHeight(0);
         b.setMinWidth(0);
@@ -552,20 +648,20 @@ public class OverlayService extends Service {
 
         GradientDrawable bg = new GradientDrawable();
         bg.setColor(bgColor);
-        bg.setCornerRadius(18f);
+        bg.setCornerRadius(16f);
         b.setBackground(bg);
 
         LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.WRAP_CONTENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
         );
-        lp.setMargins(4, 0, 4, 0);
+        lp.setMargins(3, 0, 3, 0);
         b.setLayoutParams(lp);
         return b;
     }
 
     private void updateHandleSize(int newSize) {
-        handleSize = Math.max(50, Math.min(220, newSize));
+        handleSize = Math.max(40, Math.min(200, newSize));
         prefs.edit().putInt("handle_size", handleSize).apply();
         if (sizeLabelBtn != null) {
             sizeLabelBtn.setText("Size: " + handleSize);
@@ -631,6 +727,7 @@ public class OverlayService extends Service {
         private final Paint cushionPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
         private final Paint tangentPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
         private final Paint tableBorderPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+        private final Paint ghostBallPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
 
         // Loupe paints
         private final Paint loupeBorderPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
@@ -641,11 +738,11 @@ public class OverlayService extends Service {
         public LineOverlayView(Context context) {
             super(context);
             aimPaint.setColor(Color.WHITE);
-            aimPaint.setStrokeWidth(4f);
+            aimPaint.setStrokeWidth(3.5f);
             aimPaint.setStyle(Paint.Style.STROKE);
 
             cushionPaint.setColor(Color.CYAN);
-            cushionPaint.setStrokeWidth(4f);
+            cushionPaint.setStrokeWidth(3.5f);
             cushionPaint.setStyle(Paint.Style.STROKE);
 
             tangentPaint.setColor(Color.YELLOW);
@@ -655,17 +752,21 @@ public class OverlayService extends Service {
 
             tableBorderPaint.setStyle(Paint.Style.STROKE);
 
+            ghostBallPaint.setColor(0x88FFFFFF);
+            ghostBallPaint.setStrokeWidth(2f);
+            ghostBallPaint.setStyle(Paint.Style.STROKE);
+
             loupeBorderPaint.setColor(Color.WHITE);
             loupeBorderPaint.setStyle(Paint.Style.STROKE);
-            loupeBorderPaint.setStrokeWidth(6f);
+            loupeBorderPaint.setStrokeWidth(5f);
 
             crosshairPaint.setColor(0xFFFF1744);
             crosshairPaint.setStyle(Paint.Style.STROKE);
-            crosshairPaint.setStrokeWidth(2.5f);
+            crosshairPaint.setStrokeWidth(2f);
 
             pointerPaint.setColor(0x88FFFFFF);
             pointerPaint.setStyle(Paint.Style.STROKE);
-            pointerPaint.setStrokeWidth(3f);
+            pointerPaint.setStrokeWidth(2.5f);
         }
 
         @Override
@@ -686,18 +787,31 @@ public class OverlayService extends Service {
             int h = getHeight();
             if (w == 0 || h == 0) return;
 
-            // Draw table cushion boundary
+            // 1. Draw outer cushion rail
             tableBorderPaint.setColor(isCalibrating ? 0xAA00FF00 : 0x3300FF00);
             tableBorderPaint.setStrokeWidth(isCalibrating ? 4f : 2f);
             canvas.drawRect(tableBounds, tableBorderPaint);
 
-            float cx = cueParams.x + handleSize / 2f;
-            float cy = cueParams.y + handleSize / 2f;
-            float tx = targetParams.x + handleSize / 2f;
-            float ty = targetParams.y + handleSize / 2f;
+            float ballRadius = handleSize / 2f;
 
-            // 1. Direct aim line (Cue to Target)
+            // Physical effective bounce boundary indented by exact ball radius
+            float innerL = tableBounds.left + ballRadius;
+            float innerT = tableBounds.top + ballRadius;
+            float innerR = tableBounds.right - ballRadius;
+            float innerB = tableBounds.bottom - ballRadius;
+
+            // Cue and Aim centers
+            float cx = cueParams.x + ballRadius;
+            float cy = cueParams.y + ballRadius;
+            float tx = targetParams.x + ballRadius;
+            float ty = targetParams.y + ballRadius;
+
+            // 2. Direct Cue-to-Target Aim Line
             canvas.drawLine(cx, cy, tx, ty, aimPaint);
+
+            // Ghost ball indicator at target impact
+            canvas.drawCircle(tx, ty, ballRadius, ghostBallPaint);
+            canvas.drawCircle(tx, ty, 3f, aimPaint);
 
             float dx = tx - cx;
             float dy = ty - cy;
@@ -706,36 +820,36 @@ public class OverlayService extends Service {
             dx /= len;
             dy /= len;
 
-            // 2. 90-degree tangent line at target impact
+            // 3. 90-degree tangent deflection line
             float tanX = -dy * 120f;
             float tanY = dx * 120f;
             canvas.drawLine(tx - tanX, ty - tanY, tx + tanX, ty + tanY, tangentPaint);
 
-            // 3. Cushion Bank Shot Raycast
-            if (bounces > 0 && tableBounds.width() > 100 && tableBounds.height() > 100) {
-                float curX = Math.max(tableBounds.left, Math.min(tableBounds.right, tx));
-                float curY = Math.max(tableBounds.top, Math.min(tableBounds.bottom, ty));
+            // 4. Cushion Reflection with Ball-Radius Offset Precision
+            if (bounces > 0 && (innerR > innerL + 50) && (innerB > innerT + 50)) {
+                float curX = Math.max(innerL, Math.min(innerR, tx));
+                float curY = Math.max(innerT, Math.min(innerB, ty));
                 float dirX = dx;
                 float dirY = dy;
 
                 for (int b = 0; b < bounces; b++) {
                     float minT = Float.MAX_VALUE;
-                    int side = 0;
+                    int side = 0; // 1=L, 2=R, 3=T, 4=B
 
                     if (dirX < -0.0001f) {
-                        float t = (tableBounds.left - curX) / dirX;
+                        float t = (innerL - curX) / dirX;
                         if (t > 0.01f && t < minT) {
                             float testY = curY + t * dirY;
-                            if (testY >= tableBounds.top - 2f && testY <= tableBounds.bottom + 2f) {
+                            if (testY >= innerT - 2f && testY <= innerB + 2f) {
                                 minT = t;
                                 side = 1;
                             }
                         }
                     } else if (dirX > 0.0001f) {
-                        float t = (tableBounds.right - curX) / dirX;
+                        float t = (innerR - curX) / dirX;
                         if (t > 0.01f && t < minT) {
                             float testY = curY + t * dirY;
-                            if (testY >= tableBounds.top - 2f && testY <= tableBounds.bottom + 2f) {
+                            if (testY >= innerT - 2f && testY <= innerB + 2f) {
                                 minT = t;
                                 side = 2;
                             }
@@ -743,19 +857,19 @@ public class OverlayService extends Service {
                     }
 
                     if (dirY < -0.0001f) {
-                        float t = (tableBounds.top - curY) / dirY;
+                        float t = (innerT - curY) / dirY;
                         if (t > 0.01f && t < minT) {
                             float testX = curX + t * dirX;
-                            if (testX >= tableBounds.left - 2f && testX <= tableBounds.right + 2f) {
+                            if (testX >= innerL - 2f && testX <= innerR + 2f) {
                                 minT = t;
                                 side = 3;
                             }
                         }
                     } else if (dirY > 0.0001f) {
-                        float t = (tableBounds.bottom - curY) / dirY;
+                        float t = (innerB - curY) / dirY;
                         if (t > 0.01f && t < minT) {
                             float testX = curX + t * dirX;
-                            if (testX >= tableBounds.left - 2f && testX <= tableBounds.right + 2f) {
+                            if (testX >= innerL - 2f && testX <= innerR + 2f) {
                                 minT = t;
                                 side = 4;
                             }
@@ -767,11 +881,15 @@ public class OverlayService extends Service {
                     float nextX = curX + minT * dirX;
                     float nextY = curY + minT * dirY;
 
-                    nextX = Math.max(tableBounds.left, Math.min(tableBounds.right, nextX));
-                    nextY = Math.max(tableBounds.top, Math.min(tableBounds.bottom, nextY));
+                    nextX = Math.max(innerL, Math.min(innerR, nextX));
+                    nextY = Math.max(innerT, Math.min(innerB, nextY));
 
+                    // Cushion segment
                     canvas.drawLine(curX, curY, nextX, nextY, cushionPaint);
-                    canvas.drawCircle(nextX, nextY, 8f, cushionPaint);
+
+                    // Ghost ball at rail contact
+                    canvas.drawCircle(nextX, nextY, ballRadius, ghostBallPaint);
+                    canvas.drawCircle(nextX, nextY, 4f, cushionPaint);
 
                     if (side == 1 || side == 2) dirX = -dirX;
                     else dirY = -dirY;
@@ -781,18 +899,18 @@ public class OverlayService extends Service {
                 }
             }
 
-            // 4. Magnifier Loupe above active finger position
+            // 5. Magnifier Loupe above active finger position
             if (isDragging && zoomLevel > 0) {
                 float lx = dragX;
-                float ly = dragY - 190f;
+                float ly = dragY - 180f;
 
-                // If close to top edge, shift horizontally instead of under palm
-                if (ly - LOUPE_RADIUS < 20f) {
+                // Edge avoidance: flip horizontally if close to top
+                if (ly - LOUPE_RADIUS < 15f) {
                     ly = dragY;
-                    lx = (dragX + 220f + LOUPE_RADIUS < screenW) ? (dragX + 220f) : (dragX - 220f);
+                    lx = (dragX + 200f + LOUPE_RADIUS < screenW) ? (dragX + 200f) : (dragX - 200f);
                 }
 
-                // Guide needle
+                // Guide line to ball
                 canvas.drawLine(lx, ly, dragX, dragY, pointerPaint);
 
                 canvas.save();
@@ -815,10 +933,10 @@ public class OverlayService extends Service {
                     }
                 }
 
-                // Crisp target crosshairs exactly aligned with center of ball
+                // Sub-pixel crosshair centered on the ball
                 canvas.drawLine(lx - 25f, ly, lx + 25f, ly, crosshairPaint);
                 canvas.drawLine(lx, ly - 25f, lx, ly + 25f, crosshairPaint);
-                canvas.drawCircle(lx, ly, 4f, crosshairPaint);
+                canvas.drawCircle(lx, ly, 3f, crosshairPaint);
 
                 canvas.restore();
 
@@ -840,16 +958,16 @@ public class OverlayService extends Service {
             this.label = label;
             paint.setColor(color);
             paint.setStyle(Paint.Style.STROKE);
-            paint.setStrokeWidth(4f);
+            paint.setStrokeWidth(3.5f);
 
             textPaint.setColor(color);
-            textPaint.setTextSize(20f);
+            textPaint.setTextSize(18f);
             textPaint.setTextAlign(Paint.Align.CENTER);
         }
 
         public void setDragging(boolean dragging) {
             this.isDragging = dragging;
-            setAlpha(dragging ? 0.35f : 1.0f); // Make semi-transparent so magnifier captures the ball beneath
+            setAlpha(dragging ? 0.25f : 1.0f);
             invalidate();
         }
 
@@ -857,10 +975,10 @@ public class OverlayService extends Service {
         protected void onDraw(Canvas canvas) {
             super.onDraw(canvas);
             float r = getWidth() / 2f;
-            canvas.drawCircle(r, r, r - 5f, paint);
-            canvas.drawCircle(r, r, 4f, paint);
+            canvas.drawCircle(r, r, r - 4f, paint);
+            canvas.drawCircle(r, r, 3f, paint);
             if (!isDragging) {
-                canvas.drawText(label, r, r - 10f, textPaint);
+                canvas.drawText(label, r, r - 8f, textPaint);
             }
         }
     }
