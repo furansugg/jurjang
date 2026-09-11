@@ -6,12 +6,12 @@ import android.app.NotificationManager;
 import android.app.Service;
 import android.content.Context;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.DashPathEffect;
 import android.graphics.Paint;
 import android.graphics.PixelFormat;
-import android.graphics.PointF;
 import android.graphics.RectF;
 import android.os.Build;
 import android.os.IBinder;
@@ -28,10 +28,18 @@ public class OverlayService extends Service {
     private LineOverlayView lineView;
     private View cueHandle;
     private View targetHandle;
+    private View tlHandle;
+    private View brHandle;
     private LinearLayout menuView;
 
     private WindowManager.LayoutParams cueParams;
     private WindowManager.LayoutParams targetParams;
+    private WindowManager.LayoutParams tlParams;
+    private WindowManager.LayoutParams brParams;
+
+    private final RectF tableBounds = new RectF();
+    private boolean isCalibrating = false;
+    private SharedPreferences prefs;
 
     private int bounces = 1; // 0 = off, 1 = 1 bounce, 2 = 2 bounces
     private final int HANDLE_SIZE = 120;
@@ -47,9 +55,17 @@ public class OverlayService extends Service {
         startForegroundServiceNotification();
 
         wm = (WindowManager) getSystemService(Context.WINDOW_SERVICE);
+        prefs = getSharedPreferences("8bp_aim_prefs", MODE_PRIVATE);
+
         DisplayMetrics dm = getResources().getDisplayMetrics();
         int screenW = dm.widthPixels;
         int screenH = dm.heightPixels;
+
+        // Load saved table rectangle or fallback to default 8BP table ratio
+        tableBounds.left = prefs.getFloat("t_left", screenW * 0.115f);
+        tableBounds.top = prefs.getFloat("t_top", screenH * 0.165f);
+        tableBounds.right = prefs.getFloat("t_right", screenW * 0.885f);
+        tableBounds.bottom = prefs.getFloat("t_bottom", screenH * 0.835f);
 
         // 1. Pass-through line drawing overlay
         lineView = new LineOverlayView(this);
@@ -69,17 +85,36 @@ public class OverlayService extends Service {
         // 2. Cue Ball Handle
         cueParams = createHandleParams(screenW / 3, screenH / 2);
         cueHandle = new BallHandleView(this, Color.WHITE, "CUE");
-        attachDragListener(cueHandle, cueParams);
+        attachDragListener(cueHandle, cueParams, null);
         wm.addView(cueHandle, cueParams);
 
         // 3. Target Ball Handle
         targetParams = createHandleParams((screenW / 3) * 2, screenH / 2);
         targetHandle = new BallHandleView(this, Color.RED, "AIM");
-        attachDragListener(targetHandle, targetParams);
+        attachDragListener(targetHandle, targetParams, null);
         wm.addView(targetHandle, targetParams);
 
-        // 4. Quick Menu (Toggle Cushion / Exit)
-        createMenuView(screenW);
+        // 4. Table Corner Handles (Adjustable Rectangle)
+        tlParams = createHandleParams((int) tableBounds.left - HANDLE_SIZE / 2, (int) tableBounds.top - HANDLE_SIZE / 2);
+        tlHandle = new BallHandleView(this, Color.GREEN, "TL");
+        tlHandle.setVisibility(View.GONE);
+        attachDragListener(tlHandle, tlParams, () -> {
+            tableBounds.left = tlParams.x + HANDLE_SIZE / 2f;
+            tableBounds.top = tlParams.y + HANDLE_SIZE / 2f;
+        });
+        wm.addView(tlHandle, tlParams);
+
+        brParams = createHandleParams((int) tableBounds.right - HANDLE_SIZE / 2, (int) tableBounds.bottom - HANDLE_SIZE / 2);
+        brHandle = new BallHandleView(this, Color.GREEN, "BR");
+        brHandle.setVisibility(View.GONE);
+        attachDragListener(brHandle, brParams, () -> {
+            tableBounds.right = brParams.x + HANDLE_SIZE / 2f;
+            tableBounds.bottom = brParams.y + HANDLE_SIZE / 2f;
+        });
+        wm.addView(brHandle, brParams);
+
+        // 5. Quick Menu
+        createMenuView();
     }
 
     private WindowManager.LayoutParams createHandleParams(int x, int y) {
@@ -99,7 +134,7 @@ public class OverlayService extends Service {
         return p;
     }
 
-    private void attachDragListener(View view, WindowManager.LayoutParams p) {
+    private void attachDragListener(View view, WindowManager.LayoutParams p, Runnable onDragCallback) {
         view.setOnTouchListener(new View.OnTouchListener() {
             private int initialX, initialY;
             private float touchX, touchY;
@@ -116,6 +151,7 @@ public class OverlayService extends Service {
                     case MotionEvent.ACTION_MOVE:
                         p.x = initialX + (int) (event.getRawX() - touchX);
                         p.y = initialY + (int) (event.getRawY() - touchY);
+                        if (onDragCallback != null) onDragCallback.run();
                         wm.updateViewLayout(v, p);
                         lineView.invalidate();
                         return true;
@@ -125,10 +161,10 @@ public class OverlayService extends Service {
         });
     }
 
-    private void createMenuView(int screenW) {
+    private void createMenuView() {
         menuView = new LinearLayout(this);
         menuView.setOrientation(LinearLayout.HORIZONTAL);
-        menuView.setBackgroundColor(0x88000000);
+        menuView.setBackgroundColor(0xAA000000);
 
         Button toggleBtn = new Button(this);
         toggleBtn.setText("Cushion: 1x");
@@ -140,6 +176,26 @@ public class OverlayService extends Service {
             lineView.invalidate();
         });
 
+        Button tableBtn = new Button(this);
+        tableBtn.setText("Table: LOCK");
+        tableBtn.setTextColor(Color.GREEN);
+        tableBtn.setTextSize(11);
+        tableBtn.setOnClickListener(v -> {
+            isCalibrating = !isCalibrating;
+            tableBtn.setText(isCalibrating ? "Table: EDIT" : "Table: LOCK");
+            tlHandle.setVisibility(isCalibrating ? View.VISIBLE : View.GONE);
+            brHandle.setVisibility(isCalibrating ? View.VISIBLE : View.GONE);
+            if (!isCalibrating) {
+                prefs.edit()
+                        .putFloat("t_left", tableBounds.left)
+                        .putFloat("t_top", tableBounds.top)
+                        .putFloat("t_right", tableBounds.right)
+                        .putFloat("t_bottom", tableBounds.bottom)
+                        .apply();
+            }
+            lineView.invalidate();
+        });
+
         Button closeBtn = new Button(this);
         closeBtn.setText("✕");
         closeBtn.setTextColor(Color.RED);
@@ -147,6 +203,7 @@ public class OverlayService extends Service {
         closeBtn.setOnClickListener(v -> stopSelf());
 
         menuView.addView(toggleBtn);
+        menuView.addView(tableBtn);
         menuView.addView(closeBtn);
 
         WindowManager.LayoutParams menuParams = new WindowManager.LayoutParams(
@@ -191,6 +248,8 @@ public class OverlayService extends Service {
         if (lineView != null) wm.removeView(lineView);
         if (cueHandle != null) wm.removeView(cueHandle);
         if (targetHandle != null) wm.removeView(targetHandle);
+        if (tlHandle != null) wm.removeView(tlHandle);
+        if (brHandle != null) wm.removeView(brHandle);
         if (menuView != null) wm.removeView(menuView);
     }
 
@@ -216,8 +275,6 @@ public class OverlayService extends Service {
             tangentPaint.setStyle(Paint.Style.STROKE);
             tangentPaint.setPathEffect(new DashPathEffect(new float[]{10, 10}, 0));
 
-            tableBorderPaint.setColor(0x3300FF00);
-            tableBorderPaint.setStrokeWidth(2f);
             tableBorderPaint.setStyle(Paint.Style.STROKE);
         }
 
@@ -228,9 +285,10 @@ public class OverlayService extends Service {
             int h = getHeight();
             if (w == 0 || h == 0) return;
 
-            // ponytail: static standard 8bp playing field bounds; add calibration if screen aspect ratio varies
-            RectF table = new RectF(w * 0.115f, h * 0.165f, w * 0.885f, h * 0.835f);
-            canvas.drawRect(table, tableBorderPaint);
+            // Draw table cushion boundary
+            tableBorderPaint.setColor(isCalibrating ? 0xAA00FF00 : 0x3300FF00);
+            tableBorderPaint.setStrokeWidth(isCalibrating ? 4f : 2f);
+            canvas.drawRect(tableBounds, tableBorderPaint);
 
             float cx = cueParams.x + HANDLE_SIZE / 2f;
             float cy = cueParams.y + HANDLE_SIZE / 2f;
@@ -264,30 +322,30 @@ public class OverlayService extends Service {
                     int side = 0; // 1=L, 2=R, 3=T, 4=B
 
                     if (dirX < -0.0001f) {
-                        float t = (table.left - curX) / dirX;
+                        float t = (tableBounds.left - curX) / dirX;
                         if (t > 0.001f && t < minT) {
                             float testY = curY + t * dirY;
-                            if (testY >= table.top && testY <= table.bottom) { minT = t; side = 1; }
+                            if (testY >= tableBounds.top && testY <= tableBounds.bottom) { minT = t; side = 1; }
                         }
                     } else if (dirX > 0.0001f) {
-                        float t = (table.right - curX) / dirX;
+                        float t = (tableBounds.right - curX) / dirX;
                         if (t > 0.001f && t < minT) {
                             float testY = curY + t * dirY;
-                            if (testY >= table.top && testY <= table.bottom) { minT = t; side = 2; }
+                            if (testY >= tableBounds.top && testY <= tableBounds.bottom) { minT = t; side = 2; }
                         }
                     }
 
                     if (dirY < -0.0001f) {
-                        float t = (table.top - curY) / dirY;
+                        float t = (tableBounds.top - curY) / dirY;
                         if (t > 0.001f && t < minT) {
                             float testX = curX + t * dirX;
-                            if (testX >= table.left && testX <= table.right) { minT = t; side = 3; }
+                            if (testX >= tableBounds.left && testX <= tableBounds.right) { minT = t; side = 3; }
                         }
                     } else if (dirY > 0.0001f) {
-                        float t = (table.bottom - curY) / dirY;
+                        float t = (tableBounds.bottom - curY) / dirY;
                         if (t > 0.001f && t < minT) {
                             float testX = curX + t * dirX;
-                            if (testX >= table.left && testX <= table.right) { minT = t; side = 4; }
+                            if (testX >= tableBounds.left && testX <= tableBounds.right) { minT = t; side = 4; }
                         }
                     }
 
@@ -331,7 +389,7 @@ public class OverlayService extends Service {
             super.onDraw(canvas);
             float r = getWidth() / 2f;
             canvas.drawCircle(r, r, r - 6f, paint);
-            canvas.drawCircle(r, r, 4f, paint); // Center dot
+            canvas.drawCircle(r, r, 4f, paint);
             canvas.drawText(label, r, r - 12f, textPaint);
         }
     }
