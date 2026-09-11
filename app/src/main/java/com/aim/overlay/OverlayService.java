@@ -18,6 +18,7 @@ import android.graphics.Path;
 import android.graphics.PixelFormat;
 import android.graphics.Rect;
 import android.graphics.RectF;
+import android.graphics.drawable.GradientDrawable;
 import android.hardware.display.DisplayManager;
 import android.hardware.display.VirtualDisplay;
 import android.media.Image;
@@ -35,6 +36,7 @@ import android.view.View;
 import android.view.WindowManager;
 import android.widget.Button;
 import android.widget.LinearLayout;
+import android.widget.TextView;
 
 import java.nio.ByteBuffer;
 
@@ -51,13 +53,17 @@ public class OverlayService extends Service {
     private WindowManager.LayoutParams targetParams;
     private WindowManager.LayoutParams tlParams;
     private WindowManager.LayoutParams brParams;
+    private WindowManager.LayoutParams menuParams;
 
     private final RectF tableBounds = new RectF();
     private boolean isCalibrating = false;
     private SharedPreferences prefs;
 
     private int bounces = 1;
-    private final int HANDLE_SIZE = 120;
+    private int handleSize = 100; // Adjustable ball diameter (px)
+    private final int CORNER_HANDLE_SIZE = 100;
+    private Button sizeLabelBtn;
+
     private int screenW;
     private int screenH;
     private int screenDpi;
@@ -91,6 +97,8 @@ public class OverlayService extends Service {
         screenH = dm.heightPixels;
         screenDpi = dm.densityDpi;
 
+        // Load preferences
+        handleSize = prefs.getInt("handle_size", 100);
         tableBounds.left = prefs.getFloat("t_left", screenW * 0.115f);
         tableBounds.top = prefs.getFloat("t_top", screenH * 0.165f);
         tableBounds.right = prefs.getFloat("t_right", screenW * 0.885f);
@@ -112,37 +120,37 @@ public class OverlayService extends Service {
         wm.addView(lineView, lineParams);
 
         // 2. Cue Ball Handle
-        cueParams = createHandleParams(screenW / 3, screenH / 2);
+        cueParams = createHandleParams(screenW / 3, screenH / 2, handleSize);
         cueHandle = new BallHandleView(this, Color.WHITE, "CUE");
-        attachDragListener(cueHandle, cueParams, null);
+        attachDragListener(cueHandle, cueParams, null, true);
         wm.addView(cueHandle, cueParams);
 
         // 3. Target Ball Handle
-        targetParams = createHandleParams((screenW / 3) * 2, screenH / 2);
+        targetParams = createHandleParams((screenW / 3) * 2, screenH / 2, handleSize);
         targetHandle = new BallHandleView(this, Color.RED, "AIM");
-        attachDragListener(targetHandle, targetParams, null);
+        attachDragListener(targetHandle, targetParams, null, true);
         wm.addView(targetHandle, targetParams);
 
         // 4. Table Corner Handles
-        tlParams = createHandleParams((int) tableBounds.left - HANDLE_SIZE / 2, (int) tableBounds.top - HANDLE_SIZE / 2);
+        tlParams = createHandleParams((int) tableBounds.left - CORNER_HANDLE_SIZE / 2, (int) tableBounds.top - CORNER_HANDLE_SIZE / 2, CORNER_HANDLE_SIZE);
         tlHandle = new BallHandleView(this, Color.GREEN, "TL");
         tlHandle.setVisibility(View.GONE);
         attachDragListener(tlHandle, tlParams, () -> {
-            tableBounds.left = tlParams.x + HANDLE_SIZE / 2f;
-            tableBounds.top = tlParams.y + HANDLE_SIZE / 2f;
-        });
+            tableBounds.left = tlParams.x + CORNER_HANDLE_SIZE / 2f;
+            tableBounds.top = tlParams.y + CORNER_HANDLE_SIZE / 2f;
+        }, false);
         wm.addView(tlHandle, tlParams);
 
-        brParams = createHandleParams((int) tableBounds.right - HANDLE_SIZE / 2, (int) tableBounds.bottom - HANDLE_SIZE / 2);
+        brParams = createHandleParams((int) tableBounds.right - CORNER_HANDLE_SIZE / 2, (int) tableBounds.bottom - CORNER_HANDLE_SIZE / 2, CORNER_HANDLE_SIZE);
         brHandle = new BallHandleView(this, Color.GREEN, "BR");
         brHandle.setVisibility(View.GONE);
         attachDragListener(brHandle, brParams, () -> {
-            tableBounds.right = brParams.x + HANDLE_SIZE / 2f;
-            tableBounds.bottom = brParams.y + HANDLE_SIZE / 2f;
-        });
+            tableBounds.right = brParams.x + CORNER_HANDLE_SIZE / 2f;
+            tableBounds.bottom = brParams.y + CORNER_HANDLE_SIZE / 2f;
+        }, false);
         wm.addView(brHandle, brParams);
 
-        // 5. Quick Menu
+        // 5. Clean Control Panel
         createMenuView();
     }
 
@@ -181,10 +189,10 @@ public class OverlayService extends Service {
         );
     }
 
-    private WindowManager.LayoutParams createHandleParams(int x, int y) {
+    private WindowManager.LayoutParams createHandleParams(int x, int y, int size) {
         WindowManager.LayoutParams p = new WindowManager.LayoutParams(
-                HANDLE_SIZE,
-                HANDLE_SIZE,
+                size,
+                size,
                 Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
                         ? WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
                         : WindowManager.LayoutParams.TYPE_PHONE,
@@ -198,30 +206,35 @@ public class OverlayService extends Service {
         return p;
     }
 
-    private void attachDragListener(View view, WindowManager.LayoutParams p, Runnable onDragCallback) {
+    private void attachDragListener(View view, WindowManager.LayoutParams p, Runnable onDragCallback, boolean isBall) {
         view.setOnTouchListener(new View.OnTouchListener() {
             private int initialX, initialY;
             private float touchX, touchY;
 
             @Override
             public boolean onTouch(View v, MotionEvent event) {
+                int curSize = isBall ? handleSize : CORNER_HANDLE_SIZE;
                 switch (event.getAction()) {
                     case MotionEvent.ACTION_DOWN:
                         initialX = p.x;
                         initialY = p.y;
                         touchX = event.getRawX();
                         touchY = event.getRawY();
-                        isDragging = true;
-                        dragX = p.x + HANDLE_SIZE / 2f;
-                        dragY = p.y + HANDLE_SIZE / 2f;
-                        lineView.invalidate();
+                        if (isBall) {
+                            isDragging = true;
+                            dragX = p.x + curSize / 2f;
+                            dragY = p.y + curSize / 2f;
+                            lineView.invalidate();
+                        }
                         return true;
 
                     case MotionEvent.ACTION_MOVE:
                         p.x = initialX + (int) (event.getRawX() - touchX);
                         p.y = initialY + (int) (event.getRawY() - touchY);
-                        dragX = p.x + HANDLE_SIZE / 2f;
-                        dragY = p.y + HANDLE_SIZE / 2f;
+                        if (isBall) {
+                            dragX = p.x + curSize / 2f;
+                            dragY = p.y + curSize / 2f;
+                        }
                         if (onDragCallback != null) onDragCallback.run();
                         wm.updateViewLayout(v, p);
                         lineView.invalidate();
@@ -229,8 +242,10 @@ public class OverlayService extends Service {
 
                     case MotionEvent.ACTION_UP:
                     case MotionEvent.ACTION_CANCEL:
-                        isDragging = false;
-                        lineView.invalidate();
+                        if (isBall) {
+                            isDragging = false;
+                            lineView.invalidate();
+                        }
                         return true;
                 }
                 return false;
@@ -241,22 +256,35 @@ public class OverlayService extends Service {
     private void createMenuView() {
         menuView = new LinearLayout(this);
         menuView.setOrientation(LinearLayout.HORIZONTAL);
-        menuView.setBackgroundColor(0xAA000000);
+        menuView.setGravity(Gravity.CENTER_VERTICAL);
 
-        Button toggleBtn = new Button(this);
-        toggleBtn.setText("Cushion: 1x");
-        toggleBtn.setTextColor(Color.YELLOW);
-        toggleBtn.setTextSize(11);
-        toggleBtn.setOnClickListener(v -> {
+        // Modern card background
+        GradientDrawable panelBg = new GradientDrawable();
+        panelBg.setColor(0xEE1E2128);
+        panelBg.setCornerRadius(30f);
+        panelBg.setStroke(2, 0x44FFFFFF);
+        menuView.setBackground(panelBg);
+        menuView.setPadding(18, 10, 18, 10);
+
+        // 1. Grip / Title
+        TextView grip = new TextView(this);
+        grip.setText("⠿ 8BP");
+        grip.setTextColor(0xFFAAAAAA);
+        grip.setTextSize(11f);
+        grip.setPadding(6, 0, 14, 0);
+        menuView.addView(grip);
+
+        // 2. Cushion Button
+        Button cushionBtn = createStyledButton("Cush: 1x", 0xFF00E5FF, 0x2200E5FF);
+        cushionBtn.setOnClickListener(v -> {
             bounces = (bounces + 1) % 3;
-            toggleBtn.setText(bounces == 0 ? "Cushion: OFF" : "Cushion: " + bounces + "x");
+            cushionBtn.setText(bounces == 0 ? "Cush: OFF" : "Cush: " + bounces + "x");
             lineView.invalidate();
         });
+        menuView.addView(cushionBtn);
 
-        Button tableBtn = new Button(this);
-        tableBtn.setText("Table: LOCK");
-        tableBtn.setTextColor(Color.GREEN);
-        tableBtn.setTextSize(11);
+        // 3. Table Button
+        Button tableBtn = createStyledButton("Table: LOCK", 0xFF00E676, 0x2200E676);
         tableBtn.setOnClickListener(v -> {
             isCalibrating = !isCalibrating;
             tableBtn.setText(isCalibrating ? "Table: EDIT" : "Table: LOCK");
@@ -272,18 +300,27 @@ public class OverlayService extends Service {
             }
             lineView.invalidate();
         });
-
-        Button closeBtn = new Button(this);
-        closeBtn.setText("✕");
-        closeBtn.setTextColor(Color.RED);
-        closeBtn.setTextSize(11);
-        closeBtn.setOnClickListener(v -> stopSelf());
-
-        menuView.addView(toggleBtn);
         menuView.addView(tableBtn);
+
+        // 4. Circle Size Controls ([-] Size: 100 [+])
+        Button sizeMinus = createStyledButton("–", Color.WHITE, 0x22FFFFFF);
+        sizeMinus.setOnClickListener(v -> updateHandleSize(handleSize - 10));
+        menuView.addView(sizeMinus);
+
+        sizeLabelBtn = createStyledButton("Size: " + handleSize, 0xFFFFD600, 0x22FFD600);
+        sizeLabelBtn.setOnClickListener(v -> updateHandleSize(handleSize >= 160 ? 60 : handleSize + 20));
+        menuView.addView(sizeLabelBtn);
+
+        Button sizePlus = createStyledButton("+", Color.WHITE, 0x22FFFFFF);
+        sizePlus.setOnClickListener(v -> updateHandleSize(handleSize + 10));
+        menuView.addView(sizePlus);
+
+        // 5. Close Button
+        Button closeBtn = createStyledButton("✕", 0xFFFF5252, 0x33FF5252);
+        closeBtn.setOnClickListener(v -> stopSelf());
         menuView.addView(closeBtn);
 
-        WindowManager.LayoutParams menuParams = new WindowManager.LayoutParams(
+        menuParams = new WindowManager.LayoutParams(
                 WindowManager.LayoutParams.WRAP_CONTENT,
                 WindowManager.LayoutParams.WRAP_CONTENT,
                 Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
@@ -294,7 +331,78 @@ public class OverlayService extends Service {
         );
         menuParams.gravity = Gravity.TOP | Gravity.CENTER_HORIZONTAL;
         menuParams.y = 20;
+
+        // Draggable panel
+        menuView.setOnTouchListener(new View.OnTouchListener() {
+            private int initialX, initialY;
+            private float touchX, touchY;
+
+            @Override
+            public boolean onTouch(View v, MotionEvent event) {
+                switch (event.getAction()) {
+                    case MotionEvent.ACTION_DOWN:
+                        initialX = menuParams.x;
+                        initialY = menuParams.y;
+                        touchX = event.getRawX();
+                        touchY = event.getRawY();
+                        return true;
+                    case MotionEvent.ACTION_MOVE:
+                        menuParams.x = initialX + (int) (event.getRawX() - touchX);
+                        menuParams.y = initialY + (int) (event.getRawY() - touchY);
+                        wm.updateViewLayout(menuView, menuParams);
+                        return true;
+                }
+                return false;
+            }
+        });
+
         wm.addView(menuView, menuParams);
+    }
+
+    private Button createStyledButton(String text, int textColor, int bgColor) {
+        Button b = new Button(this);
+        b.setText(text);
+        b.setTextColor(textColor);
+        b.setTextSize(11f);
+        b.setAllCaps(false);
+        b.setPadding(20, 8, 20, 8);
+        b.setMinHeight(0);
+        b.setMinimumHeight(0);
+        b.setMinWidth(0);
+        b.setMinimumWidth(0);
+
+        GradientDrawable bg = new GradientDrawable();
+        bg.setColor(bgColor);
+        bg.setCornerRadius(18f);
+        b.setBackground(bg);
+
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+        );
+        lp.setMargins(4, 0, 4, 0);
+        b.setLayoutParams(lp);
+        return b;
+    }
+
+    private void updateHandleSize(int newSize) {
+        handleSize = Math.max(50, Math.min(220, newSize));
+        prefs.edit().putInt("handle_size", handleSize).apply();
+        if (sizeLabelBtn != null) {
+            sizeLabelBtn.setText("Size: " + handleSize);
+        }
+
+        cueParams.width = handleSize;
+        cueParams.height = handleSize;
+        targetParams.width = handleSize;
+        targetParams.height = handleSize;
+
+        wm.updateViewLayout(cueHandle, cueParams);
+        wm.updateViewLayout(targetHandle, targetParams);
+
+        cueHandle.invalidate();
+        targetHandle.invalidate();
+        lineView.invalidate();
     }
 
     private void startForegroundServiceNotification() {
@@ -351,7 +459,7 @@ public class OverlayService extends Service {
         private final Path clipPath = new Path();
 
         private final float LOUPE_RADIUS = 110f;
-        private final float CROP_RADIUS = 44f; // 2.5x magnification
+        private final float CROP_RADIUS = 44f;
 
         public LineOverlayView(Context context) {
             super(context);
@@ -416,10 +524,10 @@ public class OverlayService extends Service {
             tableBorderPaint.setStrokeWidth(isCalibrating ? 4f : 2f);
             canvas.drawRect(tableBounds, tableBorderPaint);
 
-            float cx = cueParams.x + HANDLE_SIZE / 2f;
-            float cy = cueParams.y + HANDLE_SIZE / 2f;
-            float tx = targetParams.x + HANDLE_SIZE / 2f;
-            float ty = targetParams.y + HANDLE_SIZE / 2f;
+            float cx = cueParams.x + handleSize / 2f;
+            float cy = cueParams.y + handleSize / 2f;
+            float tx = targetParams.x + handleSize / 2f;
+            float ty = targetParams.y + handleSize / 2f;
 
             // 1. Direct aim line (Cue to Target)
             canvas.drawLine(cx, cy, tx, ty, aimPaint);
@@ -495,7 +603,7 @@ public class OverlayService extends Service {
                 float lx = dragX;
                 float ly = dragY - 220f;
                 if (ly - LOUPE_RADIUS < 20f) {
-                    ly = dragY + 220f; // Flip below if near top screen edge
+                    ly = dragY + 220f;
                 }
 
                 // Guide needle from loupe to contact center
@@ -550,7 +658,7 @@ public class OverlayService extends Service {
             paint.setStrokeWidth(4f);
 
             textPaint.setColor(color);
-            textPaint.setTextSize(22f);
+            textPaint.setTextSize(20f);
             textPaint.setTextAlign(Paint.Align.CENTER);
         }
 
@@ -558,9 +666,9 @@ public class OverlayService extends Service {
         protected void onDraw(Canvas canvas) {
             super.onDraw(canvas);
             float r = getWidth() / 2f;
-            canvas.drawCircle(r, r, r - 6f, paint);
+            canvas.drawCircle(r, r, r - 5f, paint);
             canvas.drawCircle(r, r, 4f, paint);
-            canvas.drawText(label, r, r - 12f, textPaint);
+            canvas.drawText(label, r, r - 10f, textPaint);
         }
     }
 }
