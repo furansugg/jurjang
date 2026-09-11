@@ -48,6 +48,7 @@ public class OverlayService extends Service {
     private View tlHandle;
     private View brHandle;
     private LinearLayout menuView;
+    private Button resetTableBtn;
 
     private WindowManager.LayoutParams cueParams;
     private WindowManager.LayoutParams targetParams;
@@ -92,17 +93,16 @@ public class OverlayService extends Service {
         wm = (WindowManager) getSystemService(Context.WINDOW_SERVICE);
         prefs = getSharedPreferences("8bp_aim_prefs", MODE_PRIVATE);
 
-        DisplayMetrics dm = getResources().getDisplayMetrics();
-        screenW = dm.widthPixels;
-        screenH = dm.heightPixels;
+        DisplayMetrics dm = new DisplayMetrics();
+        wm.getDefaultDisplay().getRealMetrics(dm);
+        // Force landscape logic (8BP is exclusively landscape)
+        screenW = Math.max(dm.widthPixels, dm.heightPixels);
+        screenH = Math.min(dm.widthPixels, dm.heightPixels);
         screenDpi = dm.densityDpi;
 
         // Load preferences
         handleSize = prefs.getInt("handle_size", 100);
-        tableBounds.left = prefs.getFloat("t_left", screenW * 0.115f);
-        tableBounds.top = prefs.getFloat("t_top", screenH * 0.165f);
-        tableBounds.right = prefs.getFloat("t_right", screenW * 0.885f);
-        tableBounds.bottom = prefs.getFloat("t_bottom", screenH * 0.835f);
+        recalculateTableBoundsFromRatios();
 
         // 1. Pass-through line drawing overlay
         lineView = new LineOverlayView(this);
@@ -132,26 +132,68 @@ public class OverlayService extends Service {
         wm.addView(targetHandle, targetParams);
 
         // 4. Table Corner Handles
-        tlParams = createHandleParams((int) tableBounds.left - CORNER_HANDLE_SIZE / 2, (int) tableBounds.top - CORNER_HANDLE_SIZE / 2, CORNER_HANDLE_SIZE);
+        tlParams = createHandleParams((int) (tableBounds.left - CORNER_HANDLE_SIZE / 2f), (int) (tableBounds.top - CORNER_HANDLE_SIZE / 2f), CORNER_HANDLE_SIZE);
         tlHandle = new BallHandleView(this, Color.GREEN, "TL");
         tlHandle.setVisibility(View.GONE);
         attachDragListener(tlHandle, tlParams, () -> {
-            tableBounds.left = tlParams.x + CORNER_HANDLE_SIZE / 2f;
-            tableBounds.top = tlParams.y + CORNER_HANDLE_SIZE / 2f;
+            tableBounds.left = Math.max(10f, Math.min(tableBounds.right - 120f, tlParams.x + CORNER_HANDLE_SIZE / 2f));
+            tableBounds.top = Math.max(10f, Math.min(tableBounds.bottom - 120f, tlParams.y + CORNER_HANDLE_SIZE / 2f));
         }, false);
         wm.addView(tlHandle, tlParams);
 
-        brParams = createHandleParams((int) tableBounds.right - CORNER_HANDLE_SIZE / 2, (int) tableBounds.bottom - CORNER_HANDLE_SIZE / 2, CORNER_HANDLE_SIZE);
+        brParams = createHandleParams((int) (tableBounds.right - CORNER_HANDLE_SIZE / 2f), (int) (tableBounds.bottom - CORNER_HANDLE_SIZE / 2f), CORNER_HANDLE_SIZE);
         brHandle = new BallHandleView(this, Color.GREEN, "BR");
         brHandle.setVisibility(View.GONE);
         attachDragListener(brHandle, brParams, () -> {
-            tableBounds.right = brParams.x + CORNER_HANDLE_SIZE / 2f;
-            tableBounds.bottom = brParams.y + CORNER_HANDLE_SIZE / 2f;
+            tableBounds.right = Math.min(screenW - 10f, Math.max(tableBounds.left + 120f, brParams.x + CORNER_HANDLE_SIZE / 2f));
+            tableBounds.bottom = Math.min(screenH - 10f, Math.max(tableBounds.top + 120f, brParams.y + CORNER_HANDLE_SIZE / 2f));
         }, false);
         wm.addView(brHandle, brParams);
 
         // 5. Clean Control Panel
         createMenuView();
+    }
+
+    private void recalculateTableBoundsFromRatios() {
+        float rL = prefs.getFloat("r_left", 0.115f);
+        float rT = prefs.getFloat("r_top", 0.165f);
+        float rR = prefs.getFloat("r_right", 0.885f);
+        float rB = prefs.getFloat("r_bottom", 0.835f);
+
+        // Clamp ratios to prevent overflow or inversion
+        if (rL < 0f || rL > 0.4f) rL = 0.115f;
+        if (rT < 0f || rT > 0.4f) rT = 0.165f;
+        if (rR > 1f || rR < 0.6f) rR = 0.885f;
+        if (rB > 1f || rB < 0.6f) rB = 0.835f;
+
+        tableBounds.left = screenW * rL;
+        tableBounds.top = screenH * rT;
+        tableBounds.right = screenW * rR;
+        tableBounds.bottom = screenH * rB;
+
+        syncCornerHandlePositions();
+        if (lineView != null) lineView.invalidate();
+    }
+
+    private void syncCornerHandlePositions() {
+        if (tlParams != null && brParams != null) {
+            tlParams.x = (int) (tableBounds.left - CORNER_HANDLE_SIZE / 2f);
+            tlParams.y = (int) (tableBounds.top - CORNER_HANDLE_SIZE / 2f);
+            brParams.x = (int) (tableBounds.right - CORNER_HANDLE_SIZE / 2f);
+            brParams.y = (int) (tableBounds.bottom - CORNER_HANDLE_SIZE / 2f);
+            if (tlHandle != null) wm.updateViewLayout(tlHandle, tlParams);
+            if (brHandle != null) wm.updateViewLayout(brHandle, brParams);
+        }
+    }
+
+    private void resetTableBoundsToDefault() {
+        prefs.edit()
+                .putFloat("r_left", 0.115f)
+                .putFloat("r_top", 0.165f)
+                .putFloat("r_right", 0.885f)
+                .putFloat("r_bottom", 0.835f)
+                .apply();
+        recalculateTableBoundsFromRatios();
     }
 
     @Override
@@ -229,8 +271,9 @@ public class OverlayService extends Service {
                         return true;
 
                     case MotionEvent.ACTION_MOVE:
-                        p.x = initialX + (int) (event.getRawX() - touchX);
-                        p.y = initialY + (int) (event.getRawY() - touchY);
+                        // Clamp drag inside screen boundaries to prevent handle loss/overflow
+                        p.x = Math.max(0, Math.min(screenW - curSize, initialX + (int) (event.getRawX() - touchX)));
+                        p.y = Math.max(0, Math.min(screenH - curSize, initialY + (int) (event.getRawY() - touchY)));
                         if (isBall) {
                             dragX = p.x + curSize / 2f;
                             dragY = p.y + curSize / 2f;
@@ -288,19 +331,32 @@ public class OverlayService extends Service {
         tableBtn.setOnClickListener(v -> {
             isCalibrating = !isCalibrating;
             tableBtn.setText(isCalibrating ? "Table: EDIT" : "Table: LOCK");
+            if (isCalibrating) {
+                syncCornerHandlePositions();
+            }
             tlHandle.setVisibility(isCalibrating ? View.VISIBLE : View.GONE);
             brHandle.setVisibility(isCalibrating ? View.VISIBLE : View.GONE);
+            if (resetTableBtn != null) {
+                resetTableBtn.setVisibility(isCalibrating ? View.VISIBLE : View.GONE);
+            }
             if (!isCalibrating) {
+                // Save normalized relative ratios (immune to resolution/overflow issues)
                 prefs.edit()
-                        .putFloat("t_left", tableBounds.left)
-                        .putFloat("t_top", tableBounds.top)
-                        .putFloat("t_right", tableBounds.right)
-                        .putFloat("t_bottom", tableBounds.bottom)
+                        .putFloat("r_left", tableBounds.left / screenW)
+                        .putFloat("r_top", tableBounds.top / screenH)
+                        .putFloat("r_right", tableBounds.right / screenW)
+                        .putFloat("r_bottom", tableBounds.bottom / screenH)
                         .apply();
             }
             lineView.invalidate();
         });
         menuView.addView(tableBtn);
+
+        // Reset Table Button (visible only in EDIT mode)
+        resetTableBtn = createStyledButton("Reset", 0xFFFF9100, 0x22FF9100);
+        resetTableBtn.setVisibility(View.GONE);
+        resetTableBtn.setOnClickListener(v -> resetTableBoundsToDefault());
+        menuView.addView(resetTableBtn);
 
         // 4. Circle Size Controls ([-] Size: 100 [+])
         Button sizeMinus = createStyledButton("–", Color.WHITE, 0x22FFFFFF);
@@ -492,6 +548,16 @@ public class OverlayService extends Service {
         }
 
         @Override
+        protected void onSizeChanged(int w, int h, int oldw, int oldh) {
+            super.onSizeChanged(w, h, oldw, oldh);
+            if (w > 0 && h > 0) {
+                screenW = w;
+                screenH = h;
+                recalculateTableBoundsFromRatios();
+            }
+        }
+
+        @Override
         protected void onDraw(Canvas canvas) {
             super.onDraw(canvas);
             int w = getWidth();
@@ -544,49 +610,66 @@ public class OverlayService extends Service {
             float tanY = dx * 120f;
             canvas.drawLine(tx - tanX, ty - tanY, tx + tanX, ty + tanY, tangentPaint);
 
-            // 3. Cushion Bank Shot Raycast
-            if (bounces > 0) {
-                float curX = tx;
-                float curY = ty;
+            // 3. Cushion Bank Shot Raycast (with overflow & corner clamp protection)
+            if (bounces > 0 && tableBounds.width() > 100 && tableBounds.height() > 100) {
+                float curX = Math.max(tableBounds.left, Math.min(tableBounds.right, tx));
+                float curY = Math.max(tableBounds.top, Math.min(tableBounds.bottom, ty));
                 float dirX = dx;
                 float dirY = dy;
 
                 for (int b = 0; b < bounces; b++) {
                     float minT = Float.MAX_VALUE;
-                    int side = 0;
+                    int side = 0; // 1=L, 2=R, 3=T, 4=B
 
                     if (dirX < -0.0001f) {
                         float t = (tableBounds.left - curX) / dirX;
-                        if (t > 0.001f && t < minT) {
+                        if (t > 0.01f && t < minT) {
                             float testY = curY + t * dirY;
-                            if (testY >= tableBounds.top && testY <= tableBounds.bottom) { minT = t; side = 1; }
+                            if (testY >= tableBounds.top - 2f && testY <= tableBounds.bottom + 2f) {
+                                minT = t;
+                                side = 1;
+                            }
                         }
                     } else if (dirX > 0.0001f) {
                         float t = (tableBounds.right - curX) / dirX;
-                        if (t > 0.001f && t < minT) {
+                        if (t > 0.01f && t < minT) {
                             float testY = curY + t * dirY;
-                            if (testY >= tableBounds.top && testY <= tableBounds.bottom) { minT = t; side = 2; }
+                            if (testY >= tableBounds.top - 2f && testY <= tableBounds.bottom + 2f) {
+                                minT = t;
+                                side = 2;
+                            }
                         }
                     }
 
                     if (dirY < -0.0001f) {
                         float t = (tableBounds.top - curY) / dirY;
-                        if (t > 0.001f && t < minT) {
+                        if (t > 0.01f && t < minT) {
                             float testX = curX + t * dirX;
-                            if (testX >= tableBounds.left && testX <= tableBounds.right) { minT = t; side = 3; }
+                            if (testX >= tableBounds.left - 2f && testX <= tableBounds.right + 2f) {
+                                minT = t;
+                                side = 3;
+                            }
                         }
                     } else if (dirY > 0.0001f) {
                         float t = (tableBounds.bottom - curY) / dirY;
-                        if (t > 0.001f && t < minT) {
+                        if (t > 0.01f && t < minT) {
                             float testX = curX + t * dirX;
-                            if (testX >= tableBounds.left && testX <= tableBounds.right) { minT = t; side = 4; }
+                            if (testX >= tableBounds.left - 2f && testX <= tableBounds.right + 2f) {
+                                minT = t;
+                                side = 4;
+                            }
                         }
                     }
 
-                    if (side == 0 || minT == Float.MAX_VALUE) break;
+                    if (side == 0 || minT == Float.MAX_VALUE || minT <= 0.01f) break;
 
                     float nextX = curX + minT * dirX;
                     float nextY = curY + minT * dirY;
+
+                    // Strictly clamp to prevent visual overflow outside table borders
+                    nextX = Math.max(tableBounds.left, Math.min(tableBounds.right, nextX));
+                    nextY = Math.max(tableBounds.top, Math.min(tableBounds.bottom, nextY));
+
                     canvas.drawLine(curX, curY, nextX, nextY, cushionPaint);
                     canvas.drawCircle(nextX, nextY, 8f, cushionPaint);
 
